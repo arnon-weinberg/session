@@ -1,0 +1,610 @@
+#!/bin/env perl
+#
+# >session save
+# >session restore [existing|matching|missing]
+# >session --session=session-name save
+# >session --session ~/.config/gnome-session/session.ini restore
+#
+# existing: Restore geometries of existing windows
+# matching: Restore geometries of matching windows [default]
+# missing:  Restore geometries of missing windows
+#
+# --session: Set session filename
+# --debug=[0-3]: Set debug level
+#
+# Note: I usually run this using Alt+F2, rather than a terminal.
+
+# Tips:
+#   Firefox: about:config -> browser.sessionstore.resume_session_once
+#   gedit: Start multiple windows in advance using -s
+#   nautilus: Start multiple windows with URLs on command-line
+
+my %exceptions = (
+  # Exceptions for applications that manage their own session restore:
+  self_managed => [
+    'Navigator.Firefox',
+    'QVCLSalFrame.libreoffice-',
+    'Pidgin.Pidgin', 'skype.Skype',
+  ],
+  # Exceptions for non-application windows:
+  non_applications => [
+    'file_progress.Nautilus',
+  ],
+  # Special handling of tray applications if xdotool is available:
+  tray_applications => [
+    'pidgin',
+    'skype',
+  ],
+  # Use custom commands when running process does not match window:
+  custom_commands => {
+    'gnome-terminal-server.Gnome-terminal' => sub{
+        my $window = shift;
+        $window->{exec} = [ 'gnome-terminal' ];
+        return ( $window );
+      },
+    'gedit.Gedit' => sub{
+        my $window = shift;
+        $window->{exec} = [ $window->{exec}->[0] ];
+        return ( $window );
+      },
+  },
+);
+
+# Note: Minimized (hidden) state is not the same as tray (actually closed)
+# Note: Super+Left/Right = "Tiled" or "Split view"; not available via wmctrl
+# Note: VLC's full-screen is different from wmctrl's full-screen...
+
+die "ERROR: Must not run as root.\n" if $< eq ( getpwnam ( 'root' ) )[2];
+die "ERROR: wmctrl is not available.\n"
+  if system ( 'which wmctrl >/dev/null 2>&1' );
+
+use strict;
+use warnings;
+no warnings ( "misc", "redefine", "uninitialized" );
+use utf8;
+#use open ( ":encoding(UTF-8)", ":std" );
+
+use Data::Dumper;
+use POSIX ':sys_wait_h';
+
+use Getopt::Long ( ":config" => "bundling", "pass_through" );
+my %opt;
+GetOptions ( \%opt, 'session=s', 'debug=s' );
+foreach ( keys ( %opt ) ) { $opt{$_} =~ s/^=// if length ( $_ ) == 1; }
+
+$|++;
+
+# Set some environment variables if needed:
+foreach (qw{ DISPLAY DBUS_SESSION_BUS_ADDRESS })
+{
+  next if exists ( $ENV{$_} );
+  $ENV{$_} = substr ( `egrep -z ^$_= /proc/\`pgrep gnome-session -u $ENV{USER}\`/environ | cut -d= -f2-`, 0, -1 );
+  die "ERROR: $_ not set.\n" if ! $ENV{$_};
+}
+
+# Set session file name:
+my $session = $opt{session} // 'session';
+$session = "$ENV{HOME}/.config/gnome-session/$session.ini"
+  if $session !~ m|[/.]|;
+
+my $windows = wmctrl(); # Get current window list
+
+my $action = shift;
+
+# Session save
+
+if    ( $action eq 'save' )
+{
+  require File::Basename;
+  require File::Path;
+  File::Path::mkpath ( File::Basename::dirname ( $session ) )
+    if ! -d '' . File::Basename::dirname ( $session );
+
+  open ( my $SES, '>', $session );
+  print $SES Data::Dumper->Dump ( [ $windows ], [ '$session' ] );
+  close ( $SES );
+
+  print "Session saved.\n";
+}
+
+# Session restore
+
+elsif ( $action eq 'restore' )
+{
+  open ( my $SES, '<', $session ) || die ( "No saved session.\n" );
+  my $session = do{ local $/ = undef; <$SES>; };
+  close ( $SES );
+
+  print "Restoring session.\n";
+  my $level = { existing => 0, matching => 1, missing => 2 }->{shift()} // 1;
+
+  eval ( $session );
+
+  # Match session windows:
+
+  print "DEBUG: Matching by ID...\n" if $opt{debug} > 1;
+
+  foreach my $session ( values ( %$session ) )
+  {
+    next if ! $session->{id};
+
+    my $current = $windows->{$session->{id}};
+    if ( exists ( $windows->{$session->{id}} ) and
+         $session->{pid}     eq $current->{pid}   and
+         $session->{class}   eq $current->{class} and
+         $session->{command} eq $current->{command} )
+    {
+      print "DEBUG: $session->{Name} ($session->{id}) exists\n"
+        if $opt{debug} > 1;
+      $session->{cid} = $current->{id};
+      $current->{sid} = $session->{id};
+    }
+    else
+    {
+      # Delete the pid to prevent matching by properties...
+      delete ( $session->{pid} );
+    }
+  }
+
+  my %stat = ( exec => 1 );
+  while ( $level > 0 and $stat{exec} )
+  {
+    print "DEBUG: Matching by properties...\n" if $opt{debug} > 1;
+
+    # First, score each potential session<->current match:
+    my %score = ();
+    foreach my $session ( values ( %$session ) )
+    {
+      next if ! $session->{id} or $session->{cid};
+
+      foreach my $current ( values ( %$windows ) )
+      {
+        # Potential matches must have the same command (comm) and at
+        # least one of name, full command line, or class must match:
+        next if ! $current->{id} or $current->{sid} or
+                $current->{comm} ne $session->{comm};
+
+        my $score = 0;
+        $score += int ( similarity ( $session->{name}, $current->{name} ) *9 );
+        $score += 8 if $session->{command}   eq $current->{command};
+        $score += 7 if $session->{class}     eq $current->{class};
+        $score += 3 if $session->{workspace} eq $current->{workspace};
+        $score += 1 if $session->{pid}       eq $current->{pid};
+        $score += 1 if $session->{geometry}  eq $current->{geometry};
+        $score += 1 if roughly_equal ( $session->{geometry},
+                                       $current->{geometry} );
+        $score{$session->{comm}}{$session->{id}}{$current->{id}} = $score
+          if $score > 6;
+      }
+    }
+
+    # Next, find the best overall session<->current match set (map):
+    foreach my $comm ( keys ( %score ) )
+    {
+      print "DEBUG: Group $comm ("
+            . ( keys ( %{$score{$comm}} ) +0 ) . " windows)...\n"
+        if $opt{debug} > 2;
+      my ( $score, $map ) = depth_first_search ( $score{$comm} );
+      print "DEBUG: Best match score = $score\n" if $opt{debug} > 2;
+
+      # This is basically a travelling salesman problem, solved using a
+      # recursive depth-first search algorithm...  It goes through every
+      # possible session<->current set (map) combination, to find which has
+      # the highest total score.
+      sub depth_first_search
+      {
+        my ( $comm, $sid, $cid ) = ( @_ );
+
+        # Pick the next saved session ID:
+        my %sid = %{$sid // {}}; my $sid;
+        foreach ( keys ( %$comm ) )
+        {
+          next if $sid{$_};
+          $sid = $_;
+          last;
+        }
+        return ( 0, \%sid ) if ! $sid;
+
+        my %best = ( score => 0 );
+
+        # Pick the next current window ID:
+        my %cid = %{$cid // {}};
+        foreach my $cid ( keys ( %{$comm->{$sid}} ),
+                          map "NULL#$_", 1 .. keys ( %$comm )
+                                            - keys ( %{$comm->{$sid}} ) )
+        {
+          next if $cid{$cid};
+          $cid{$cid}++;
+          $sid{$sid} = $cid;
+          # NULL = no match (ie, when there are fewer windows than session):
+          my $_score = $cid =~ /^NULL#\d+$/ ? 1 : $comm->{$sid}->{$cid};
+
+          print "DEBUG: ".('  ' x keys(%sid))."Trying $sid + $cid...\n"
+            if $opt{debug} > 2;
+          my ( $score, $map ) = depth_first_search ( $comm, \%sid, \%cid );
+          $best{last} = ! $score; # Only care about score on the last sid
+          print "DEBUG: ".('  ' x keys(%sid))."Result = $_score"
+                . ( $score ? " + $score (best) = " . ( $_score + $score )
+                           : '' ) . "\n"
+            if $opt{debug} > 2;
+          $score += $_score;
+          if ( $score > $best{score} )
+          {
+            %best = ( sid => $map, cid => $cid,
+                      last => $best{last}, score => $score );
+          }
+
+          delete ( $cid{$cid} );
+        }
+
+        return ( $best{score}, $best{score} ? $best{sid} : \%sid );
+      }
+
+      # Record the resulting set (map):
+      foreach ( keys ( %$map ) )
+      {
+        next if $map->{$_} =~ /^NULL#\d+$/;
+
+        my $session = $session->{$_};
+        my $current = $windows->{$map->{$_}};
+        print "DEBUG: $session->{Name} ($session->{id})"
+              . " matches $current->{Name} ($current->{id})"
+              . " (score=$score{$comm}{$session->{id}}{$current->{id}})\n"
+          if $opt{debug} > 1;
+        # Mark as tentative matches:
+        $session->{_cid} = $current->{id};
+        $current->{_sid} = $session->{id};
+      }
+    }
+
+    if ( $level > 1 )
+    {
+      print "DEBUG: Restoring missing windows...\n" if $opt{debug} > 2;
+
+      $stat{comm} = {};
+      foreach my $session ( values ( %$session ) )
+      {
+        next if ! $session->{id} or $session->{cid} or $session->{_cid};
+        # Check if previously launched process matched a different window:
+        if ( $session->{pid} and
+             my $current = ( grep { $session->{pid} eq $_->{pid} }
+                                  ( values ( %$windows ) ) )[0] )
+        {
+          delete ( $session->{pid} ) if $current->{_sid};
+        }
+        next if $session->{pid};
+        # Only launch once per self_managed application:
+        next if grep { /^\Q$session->{class}\E/ }
+                     ( @{$exceptions{self_managed}} ) and
+                $stat{self_managed}{$session->{class}}++;
+        # Only launch once per command (comm) per round:
+        next if $stat{comm}{$session->{comm}}++;
+
+        $session->{pid} = fork();
+        if ( ! $session->{pid} )
+        {
+          open ( STDERR, '>>', "$ENV{HOME}/.xsession-errors" ) || die;
+          exec ( @{$session->{exec}} ) || die;
+        }
+        print "DEBUG: $session->{Name} ($session->{id})"
+              . " - attempting to restore window"
+              . ( $opt{debug} > 2 ? " (pid=$session->{pid})" : '' ) . "...\n"
+          if $opt{debug};
+        $session->{wait} = 5; # Rounds to wait (heuristic)
+      }
+
+      print "DEBUG: Checking launch progress...\n" if $opt{debug} > 2;
+
+      $stat{wait} = 1;
+      while ( $stat{exec} and $stat{wait} )
+      {
+        $stat{exec} = 0;
+        foreach my $session ( values ( %$session ) )
+        {
+          next if ! $session->{id} or $session->{cid} or ! $session->{pid};
+
+          # Check if the window launched and matched successfully:
+          if    ( $session->{_cid} )
+          {
+            # Delete pid in case it gets rematched to something else later...
+            delete ( $session->{pid} );
+          }
+          # Skip abandoned launches:
+          elsif ( ! $session->{wait} ) {}
+          elsif ( ! --$session->{wait} )
+          {
+            print "DEBUG: $session->{Name} ($session->{id}) tired of waiting"
+                  . " for launch (pid=$session->{pid})\n" if $opt{debug} > 2;
+          }
+          elsif ( grep { $session->{pid} eq $_->{pid} }
+                       ( values ( %$windows ) ) )
+          {
+            print "DEBUG: $session->{Name} ($session->{id}) process launched"
+                  . " unmatched window (pid=$session->{pid})\n"
+              if $opt{debug} > 2;
+            $stat{wait} = $session->{wait} = 0;
+            $stat{exec}++;
+          }
+          elsif ( waitpid($session->{pid},WNOHANG) )
+          {
+            print "DEBUG: $session->{Name} ($session->{id}) launch process may"
+                  . " have died (pid=$session->{pid})\n" if $opt{debug} > 2;
+            $stat{wait} = $session->{wait} = 0;
+            $stat{exec}++;
+          }
+          else
+          {
+            print "DEBUG: $session->{Name} ($session->{id}) still waiting on"
+                  . " launch (pid=$session->{pid})\n" if $opt{debug} > 2;
+            $stat{exec}++;
+          }
+        }
+
+        if ( $stat{exec} )
+        {
+          # Calculate a load-adjusted wait time:
+          my $load = `cut -d" " -f1 /proc/loadavg`+0;
+          my $wait = int(3**$load);
+          $wait = 10 if $wait > 10;
+
+          print "DEBUG: Waiting $wait seconds (load=$load)...\n"
+            if $opt{debug} > 2;
+          sleep ( $wait );
+
+          # Check for window changes:
+          my $temp = join ( ',', sort ( keys ( %$windows ) ) ) if $stat{wait};
+          $windows = wmctrl ( $windows );
+          $stat{wait} = ( $temp eq join ( ',', sort ( keys ( %$windows ) ) ) );
+        }
+      }
+    }
+
+    last if $level < 2;
+  }
+
+  print "DEBUG: Restoring window properties...\n" if $opt{debug} > 1;
+
+  foreach my $session ( sort { $a->{workspace} <=> $b->{workspace} }
+                             ( values ( %$session ) ) )
+  {
+    $session->{cid} //= $session->{_cid};
+    next if ! $session->{cid};
+    my $current = $windows->{$session->{cid}};
+
+    if ( $session->{workspace} ne $current->{workspace} )
+    {
+      print "DEBUG: $current->{Name} ($current->{id})"
+            . " - move workspace from $current->{workspace}"
+                               . " => $session->{workspace}\n" if $opt{debug};
+      # Sometimes new workspaces take time to generate:
+      sleep 1 if `wmctrl -d | wc -l` < $session->{workspace}+1;
+      system ( "wmctrl -ir $current->{id} -t $session->{workspace}" );
+    }
+
+    if ( ( $session->{state}->{'_NET_WM_STATE_MAXIMIZED_VERT'} or
+           $session->{state}->{'_NET_WM_STATE_MAXIMIZED_HORZ'} ) and
+         ! roughly_equal ( $session->{geometry}, $current->{geometry} ) )
+    {
+      print "DEBUG: $current->{Name} ($current->{id})"
+            . " - switch from $current->{geometry}"
+                       . " => $session->{geometry}\n" if $opt{debug};
+      system ( "wmctrl -ir $current->{id} -b toggle,maximized_horz" )
+        if delete ( $current->{state}->{'_NET_WM_STATE_MAXIMIZED_HORZ'} );
+      system ( "wmctrl -ir $current->{id} -b toggle,maximized_vert" )
+        if delete ( $current->{state}->{'_NET_WM_STATE_MAXIMIZED_VERT'} );
+      system ( "wmctrl -ir $current->{id} -e $session->{geometry}" );
+    }
+
+    # Work around wmctrl bugs with minimization (hidden):
+    # https://bugs.launchpad.net/ubuntu/+source/wmctrl/+bug/260875
+    if    ( $session->{state}->{'_NET_WM_STATE_HIDDEN'} and
+          ! $current->{state}->{'_NET_WM_STATE_HIDDEN'} )
+    {
+      print "DEBUG: $current->{Name} ($current->{id})"
+            . " - minimize window\n" if $opt{debug};
+      if ( ! system ( 'which xdotool >/dev/null 2>&1' ) )
+      {
+        # The preferred solution:
+        system ( "xdotool windowminimize $current->{id}" );
+      }
+      else
+      {
+        # A fallback hack:
+        system ( "wmctrl -ir $current->{id} -b add,hidden,shaded" );
+      }
+    }
+    elsif ( ! $session->{state}->{'_NET_WM_STATE_HIDDEN'} and
+              $current->{state}->{'_NET_WM_STATE_HIDDEN'} and
+            ! $session->{state}->{'_NET_WM_STATE_SHADED'} )
+    {
+      print "DEBUG: $current->{Name} ($current->{id})"
+            . " - unminimize window\n" if $opt{debug};
+      system ( "wmctrl -ia $current->{id}" );
+      delete ( $current->{state}->{'_NET_WM_STATE_SHADED'} );
+    }
+    # In several situations shaded and hidden go hand in hand...
+    $current->{state}->{'_NET_WM_STATE_SHADED'}
+        = $session->{state}->{'_NET_WM_STATE_SHADED'}
+      if $session->{state}->{'_NET_WM_STATE_HIDDEN'} and
+         system ( 'which xdotool >/dev/null 2>&1' );
+
+    foreach my $prop ( keys ( %{$session->{state}} ),
+                       keys ( %{$current->{state}} ) )
+    {
+      if ( $session->{state}->{$prop} ne $current->{state}->{$prop} )
+      {
+        $prop =~ s/^_NET_WM_STATE_//;
+        my $actions = {
+          'MAXIMIZED_VERT' => "wmctrl -ir $current->{id} -b toggle,maximized_vert",
+          'MAXIMIZED_HORZ' => "wmctrl -ir $current->{id} -b toggle,maximized_horz",
+          'SHADED' => "wmctrl -ir $current->{id} -b toggle,shaded",
+          'FULLSCREEN' => "wmctrl -ir $current->{id} -b toggle,fullscreen",
+        };
+        next if ! $actions->{$prop};
+
+        print "DEBUG: $current->{Name} ($current->{id})"
+              . " - toggle property $prop\n" if $opt{debug};
+        system ( $actions->{$prop} );
+      }
+    }
+
+    if ( $session->{geometry} ne $current->{geometry} )
+    {
+      # Apparently exact positioning is a tough ask:
+      print "DEBUG: $current->{Name} ($current->{id})"
+            . " - move from $current->{geometry} => $session->{geometry}\n"
+        if $opt{debug} and
+           ! roughly_equal ( $session->{geometry}, $current->{geometry} );
+      system ( "wmctrl -ir $current->{id} -e $session->{geometry}" );
+    }
+  }
+
+  system ( "wmctrl -ia $windows->{''}->{focus}" ) if $windows->{''}->{focus};
+}
+else
+{
+  die ( "Usage: session save\n"
+      . "       session restore existing|matching|missing\n" );
+}
+
+# Get current window list from wmctrl
+sub wmctrl
+{
+  my $windows = shift // {};
+
+  open ( my $WIN, 'wmctrl -lpGx|' );
+  while ( <$WIN> )
+  {
+    chop;
+
+    my ( @window ) = split ( /\s+/ );
+    next if exists ( $windows->{$window[0]} );
+
+    my $window = $windows->{$window[0]} // {};
+
+    ( $window->{id}, $window->{workspace}, $window->{pid},
+      undef, undef, undef, undef, $window->{class} ) = @window;
+
+    $window->{Name} = ( $window->{class} =~ /\.([^.]+)$/ )[0];
+    $window->{name} = ( /^(?:\S+\s+){8}(.+)$/ )[0];
+    # The wmctrl XxY coordinates are apparentlly unreliable:
+    @window[3,4] = ( `xwininfo -id $window->{id}` =~ /^\s*Absolute upper-left [XY]:\s*(-?\d+)$/gm );
+    $window->{geometry} = join ( ',', 10, @window[3..6] );
+    $window->{command} = substr ( `cat /proc/$window->{pid}/cmdline`, 0, -1 );
+    $window->{exec} = [ split ( /\0/, $window->{command} ) ];
+    $window->{comm} = $window->{exec}->[0];
+    my $state = `xprop -id $window->{id} _NET_WM_STATE`;
+    $state = ( split ( ' = ', substr ( $state, 0, -1 ) ) )[1];
+    map { $window->{state}->{$_}++; } ( split ( /\s*,\s*/, $state ) );
+
+    $windows->{''}->{focus} //= $window->{id}
+      if $window->{state}->{'_NET_WM_STATE_FOCUSED'};
+
+    $windows->{$window[0]} //= $window;
+  }
+  close ( $WIN );
+
+  # Get tray applications from xdotool (if available):
+  if ( ! system ( 'which xdotool >/dev/null 2>&1' ) )
+  {
+    my %class = ();
+    my $temp = '^' . join ( '$|^', @{$exceptions{tray_applications}} ) . '$';
+    foreach my $id ( `xdotool search --any --classname '$temp'` )
+    {
+      chop;
+
+      next if exists ( $windows->{$id} );
+
+      my $window = $windows->{$id} // {};
+
+      $window->{id} = '0x' . lc ( sprintf ( '%08x', $id ) );
+      open ( my $WIN, "xprop -id $window->{id} -notype"
+                      . ' WM_CLASS WM_NAME _NET_WM_PID|' );
+      my %xprop = ();
+      while ( <$WIN> )
+      {
+        chop;
+        $xprop{$1} = $2 if /^(\w+)\s+=\s+(\S.*)$/;
+      }
+      close ( $WIN );
+
+      if ( ! $class{$xprop{WM_CLASS}}++ )
+      {
+        $window->{pid} = $xprop{'_NET_WM_PID'};
+        $window->{class} = join ( '.', split ( '", "', $xprop{WM_CLASS} ) );
+        $window->{class} =~ s/^"|"$//g;
+        $window->{Name} = ( $window->{class} =~ /\.([^.]+)$/ )[0];
+        $window->{name} = $xprop{WM_NAME};
+        $window->{command} = substr ( `cat /proc/$window->{pid}/cmdline`,
+                                      0, -1 );
+        $window->{exec} = [ split ( /\0/, $window->{command} ) ];
+        $window->{comm} = $window->{exec}->[0];
+
+        $windows->{$window->{id}} //= $window;
+      }
+    }
+  }
+
+  # Apply exceptions:
+  foreach my $window ( values ( %$windows ) )
+  {
+    $window = $exceptions{custom_commands}{$window->{class}}->($window)
+      if exists ( $exceptions{custom_commands}{$window->{class}} );
+    delete ( $windows->{$window->{id}} )
+      if $window->{id} and grep { /^\Q$window->{class}\E/ }
+                                ( @{$exceptions{non_applications}} );
+  }
+
+  return ( $windows );
+}
+
+# Hack: Check if 2 geometries are roughly equal:
+sub roughly_equal
+{
+  my @geometry1 = split ( ',', shift );
+  my @geometry2 = split ( ',', shift );
+
+  foreach my $i ( 0 .. $#geometry1 )
+  {
+    # Some applications don't like having negative coordinates:
+    return 0 if ( $geometry1[$i] >= 0 or $geometry2[$i] >= 0 ) and
+                abs ( $geometry1[$i] - $geometry2[$i] ) > 15;
+  }
+
+  return 1;
+}
+
+# Normalize the levenshtein algorithm to a percentage:
+sub similarity
+{
+  my $score = levenshtein ( @_ );
+  my $len = length ( $_[0] ) > length ( $_[1] )
+          ? length ( $_[0] ) : length ( $_[1] );
+  return ( 1 - ($score/$len) );
+}
+
+# Copied from: https://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Levenshtein_distance#Perl
+
+use List::Util qw(min);
+
+sub levenshtein {
+    my ($str1, $str2) = @_;
+    my @ar1 = split //, $str1;
+    my @ar2 = split //, $str2;
+
+    my @dist;
+    $dist[$_][0] = $_ foreach (0 .. @ar1);
+    $dist[0][$_] = $_ foreach (0 .. @ar2);
+
+    foreach my $i (1 .. @ar1){
+        foreach my $j (1 .. @ar2){
+            my $cost = $ar1[$i - 1] eq $ar2[$j - 1] ? 0 : 1;
+            $dist[$i][$j] = min(
+                        $dist[$i - 1][$j] + 1, 
+                        $dist[$i][$j - 1] + 1, 
+                        $dist[$i - 1][$j - 1] + $cost );
+        }
+    }
+
+    return $dist[@ar1][@ar2];
+}
