@@ -12,7 +12,7 @@
 # --session: Set session filename
 # --debug=[0-3]: Set debug level
 #
-# Note: I usually run this using Alt+F2, rather than a terminal.
+# For more details see: http://technology.research-lab.ca/?p=1041
 
 # Tips:
 #   Firefox: about:config -> browser.sessionstore.resume_session_once
@@ -40,11 +40,6 @@ my %exceptions = (
     'gnome-terminal-server.Gnome-terminal' => sub{
         my $window = shift;
         $window->{exec} = [ 'gnome-terminal' ];
-        return ( $window );
-      },
-    'gedit.Gedit' => sub{
-        my $window = shift;
-        $window->{exec} = [ $window->{exec}->[0] ];
         return ( $window );
       },
   },
@@ -142,7 +137,7 @@ elsif ( $action eq 'restore' )
     else
     {
       # Delete the pid to prevent matching by properties...
-      delete ( $session->{pid} );
+      $session->{pid_group} = delete ( $session->{pid} );
     }
   }
 
@@ -165,7 +160,7 @@ elsif ( $action eq 'restore' )
                 $current->{comm} ne $session->{comm};
 
         my $score = 0;
-        $score += int ( similarity ( $session->{name}, $current->{name} ) *9 );
+        $score += int ( similarity ( $session->{name}, $current->{name} ) *12);
         $score += 8 if $session->{command}   eq $current->{command};
         $score += 7 if $session->{class}     eq $current->{class};
         $score += 3 if $session->{workspace} eq $current->{workspace};
@@ -209,14 +204,15 @@ elsif ( $action eq 'restore' )
 
         # Pick the next current window ID:
         my %cid = %{$cid // {}};
-        foreach my $cid ( keys ( %{$comm->{$sid}} ),
-                          map "NULL#$_", 1 .. keys ( %$comm )
-                                            - keys ( %{$comm->{$sid}} ) )
+        # @NULL = no match case (ie, fewer windows than session):
+        my @NULL = ( keys ( %$comm ) - keys ( %{$comm->{$sid}} )
+                       > grep { /^NULL#\d+$/ } ( values ( %sid ) ) )
+                   ? ( 'NULL#'.(keys ( %sid )+0) ) : ();
+        foreach my $cid ( keys ( %{$comm->{$sid}} ), @NULL )
         {
           next if $cid{$cid};
           $cid{$cid}++;
           $sid{$sid} = $cid;
-          # NULL = no match (ie, when there are fewer windows than session):
           my $_score = $cid =~ /^NULL#\d+$/ ? 1 : $comm->{$sid}->{$cid};
 
           print "DEBUG: ".('  ' x keys(%sid))."Trying $sid + $cid...\n"
@@ -254,6 +250,15 @@ elsif ( $action eq 'restore' )
         # Mark as tentative matches:
         $session->{_cid} = $current->{id};
         $current->{_sid} = $session->{id};
+
+        # Permit another instance of this pid_group (old pid):
+        if ( $stat{pid}{$session->{pid_group}} )
+        {
+          # The pid may belong to this session, or another session in the
+          # pid_group; either way, delete it to permit another instance:
+          delete ( $stat{pid}{$session->{pid_group}}{pid} );
+          $stat{pid}{$session->{pid_group}} = 0;
+        }
       }
     }
 
@@ -261,24 +266,17 @@ elsif ( $action eq 'restore' )
     {
       print "DEBUG: Restoring missing windows...\n" if $opt{debug} > 2;
 
-      $stat{comm} = {};
       foreach my $session ( values ( %$session ) )
       {
-        next if ! $session->{id} or $session->{cid} or $session->{_cid};
-        # Check if previously launched process matched a different window:
-        if ( $session->{pid} and
-             my $current = ( grep { $session->{pid} eq $_->{pid} }
-                                  ( values ( %$windows ) ) )[0] )
-        {
-          delete ( $session->{pid} ) if $current->{_sid};
-        }
-        next if $session->{pid};
+        next if ! $session->{id} or $session->{cid} or
+                $session->{_cid} or $session->{pid};
         # Only launch once per self_managed application:
         next if grep { /^\Q$session->{class}\E/ }
                      ( @{$exceptions{self_managed}} ) and
                 $stat{self_managed}{$session->{class}}++;
-        # Only launch once per command (comm) per round:
-        next if $stat{comm}{$session->{comm}}++;
+        # Only launch once per pid_group (old pid) per round:
+        next if $stat{pid}{$session->{pid_group}};
+        $stat{pid}{$session->{pid_group}} = $session;
 
         $session->{pid} = fork();
         if ( ! $session->{pid} )
@@ -290,7 +288,7 @@ elsif ( $action eq 'restore' )
               . " - attempting to restore window"
               . ( $opt{debug} > 2 ? " (pid=$session->{pid})" : '' ) . "...\n"
           if $opt{debug};
-        $session->{wait} = 5; # Rounds to wait (heuristic)
+        $session->{wait} = 12; # Rounds to wait (heuristic)
       }
 
       print "DEBUG: Checking launch progress...\n" if $opt{debug} > 2;
@@ -301,16 +299,11 @@ elsif ( $action eq 'restore' )
         $stat{exec} = 0;
         foreach my $session ( values ( %$session ) )
         {
-          next if ! $session->{id} or $session->{cid} or ! $session->{pid};
+          next if ! $session->{id} or $session->{cid} or
+                  $session->{_cid} or ! $session->{pid};
 
-          # Check if the window launched and matched successfully:
-          if    ( $session->{_cid} )
-          {
-            # Delete pid in case it gets rematched to something else later...
-            delete ( $session->{pid} );
-          }
           # Skip abandoned launches:
-          elsif ( ! $session->{wait} ) {}
+          if ( ! $session->{wait} ) {}
           elsif ( ! --$session->{wait} )
           {
             print "DEBUG: $session->{Name} ($session->{id}) tired of waiting"
@@ -322,15 +315,17 @@ elsif ( $action eq 'restore' )
             print "DEBUG: $session->{Name} ($session->{id}) process launched"
                   . " unmatched window (pid=$session->{pid})\n"
               if $opt{debug} > 2;
-            $stat{wait} = $session->{wait} = 0;
-            $stat{exec}++;
+            $stat{wait} = $session->{wait} = 0;    # Retry matching process
+            $stat{exec}++;                         # after a waiting period
           }
           elsif ( waitpid($session->{pid},WNOHANG) )
           {
             print "DEBUG: $session->{Name} ($session->{id}) launch process may"
-                  . " have died (pid=$session->{pid})\n" if $opt{debug} > 2;
-            $stat{wait} = $session->{wait} = 0;
-            $stat{exec}++;
+                  . " have died (pid=$session->{pid}) status=$?\n"
+              if $opt{debug} > 2;
+            $stat{pid}{$session->{pid_group}} = 0; # Permit another instance
+            $stat{wait} = $session->{wait} = 0;    # Retry matching process
+            $stat{exec}++;                         # after a waiting period
           }
           else
           {
@@ -491,7 +486,9 @@ sub wmctrl
     @window[3,4] = ( `xwininfo -id $window->{id}` =~ /^\s*Absolute upper-left [XY]:\s*(-?\d+)$/gm );
     $window->{geometry} = join ( ',', 10, @window[3..6] );
     $window->{command} = substr ( `cat /proc/$window->{pid}/cmdline`, 0, -1 );
-    $window->{exec} = [ split ( /\0/, $window->{command} ) ];
+    # The generic --gapplication-service argument does not launch windows:
+    $window->{exec} = [ grep { ! /^--gapplication-service$/ }
+                             ( split ( /\0/, $window->{command} ) ) ];
     $window->{comm} = $window->{exec}->[0];
     my $state = `xprop -id $window->{id} _NET_WM_STATE`;
     $state = ( split ( ' = ', substr ( $state, 0, -1 ) ) )[1];
